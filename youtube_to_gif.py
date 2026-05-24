@@ -802,7 +802,7 @@ class YouTubeToGifConverter:
         if not self.is_playing:
             return
         fps = max(1.0, self.video_fps)
-        step = 1.0 / fps
+        step = 5.5 / fps
         t = self.seek_time.get() + step
         if t >= self.video_duration:
             self.is_playing = False
