@@ -1,0 +1,34 @@
+# 動画ファイル
+*.mp4
+*.mkv
+*.webm
+*.avi
+*.mov
+*.flv
+*.wmv
+*.m4v
+*.mpg
+*.mpeg
+*.3gp
+*.ts
+*.m2ts
+*.vob
+*.ogv
+*.f4v
+
+# 音声ファイル（yt-dlpが音声のみ落とす場合）
+*.m4a
+*.mp3
+*.aac
+*.opus
+*.wav
+*.flac
+
+# このプロジェクトの生成物
+youtube_temp/
+*.gif
+*.part
+*.ytdl
+
+# 一時パレットファイル（出力GIFと同名のpng）
+output.png
