@@ -32,11 +32,12 @@ class YouTubeToGifConverter:
         self.video_duration = 0.0
         self.video_width = 0
         self.video_height = 0
+        self.video_fps = 25.0
 
         # プレビュー表示関連
-        self.preview_image = None       # PhotoImage (時間タブ)
-        self.region_preview_image = None  # PhotoImage (領域タブ)
-        self.preview_scale = 1.0        # 表示倍率 (元動画 → キャンバス)
+        self.preview_image = None
+        self.region_preview_image = None
+        self.preview_scale = 1.0
         self.canvas_img_w = 0
         self.canvas_img_h = 0
 
@@ -44,31 +45,38 @@ class YouTubeToGifConverter:
         self.drag_start = None
         self.drag_rect = None
 
+        # シーク制御
+        self.is_playing = False
+        self._play_job = None
+        self._drag_debounce = None
+        self._seek_seq = 0
+
+        # ズーム
+        self._current_zoom = 1.0
+        self.zoom_start = 0.0
+        self.zoom_end = 0.0  # 0 = video_duration と同義
+
         self.setup_ui()
+        self._setup_keybindings()
         self.log("アプリケーション起動")
         self.log(f"スクリプトディレクトリ: {Path(__file__).parent.resolve()}")
         if not PIL_AVAILABLE:
             self.log("⚠️  Pillow が見つかりません。プレビュー機能は無効です (pip install pillow)")
 
     def log(self, message):
-        """ログメッセージを表示"""
         timestamp = datetime.now().strftime("%H:%M:%S")
         log_msg = f"[{timestamp}] {message}"
-
         if hasattr(self, 'log_text'):
             self.log_text.config(state=tk.NORMAL)
             self.log_text.insert(tk.END, log_msg + "\n")
             self.log_text.see(tk.END)
             self.log_text.config(state=tk.DISABLED)
-
         print(log_msg)
 
     def setup_ui(self):
-        # メインフレーム
         main_frame = ttk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # 左側: タブコントロール
         left_frame = ttk.Frame(main_frame)
         left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
 
@@ -91,7 +99,6 @@ class YouTubeToGifConverter:
         notebook.add(tab4, text="GIFに変換")
         self.setup_tab4(tab4)
 
-        # 右側: ログウィンドウ
         right_frame = ttk.LabelFrame(main_frame, text="デバッグログ", padding=10)
         right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, padx=10, pady=10)
 
@@ -111,7 +118,6 @@ class YouTubeToGifConverter:
         self.url_entry.grid(row=0, column=1, sticky=tk.EW, pady=5, padx=5)
         ttk.Button(frame, text="ダウンロード", command=self.download_video).grid(row=0, column=2, padx=5)
 
-        # ローカルファイルを開くボタン
         ttk.Button(frame, text="ローカル動画を開く", command=self.open_local_video).grid(row=1, column=2, padx=5, pady=5)
 
         self.status_label = ttk.Label(frame, text="待機中...", foreground="gray")
@@ -143,52 +149,99 @@ class YouTubeToGifConverter:
         preview_frame = ttk.LabelFrame(frame, text="プレビュー", padding=5)
         preview_frame.pack(fill=tk.BOTH, expand=True, pady=5)
 
-        self.time_canvas = tk.Canvas(preview_frame, bg="gray20", width=480, height=270)
+        self.time_canvas = tk.Canvas(preview_frame, bg="gray20", width=480, height=240)
         self.time_canvas.pack(fill=tk.BOTH, expand=True)
 
+        # タイムラインバー（クリック/ドラッグでシーク可能）
+        self.timeline_canvas = tk.Canvas(preview_frame, bg="#1a1a1a", height=40, cursor="sb_h_double_arrow")
+        self.timeline_canvas.pack(fill=tk.X, padx=2, pady=(2, 0))
+        self.timeline_canvas.bind("<ButtonPress-1>", self.on_timeline_press)
+        self.timeline_canvas.bind("<B1-Motion>", self.on_timeline_drag)
+        self.timeline_canvas.bind("<ButtonRelease-1>", self.on_timeline_release)
+
         # スライダー部分
-        slider_frame = ttk.LabelFrame(frame, text="時間範囲を選択", padding=10)
+        slider_frame = ttk.LabelFrame(frame, text="時間範囲を選択", padding=8)
         slider_frame.pack(fill=tk.X, pady=5)
 
-        # シーク（プレビュー位置）スライダー
-        ttk.Label(slider_frame, text="シーク位置 (秒):").grid(row=0, column=0, sticky=tk.W, pady=5)
+        # Row 0: シーク
+        ttk.Label(slider_frame, text="シーク:").grid(row=0, column=0, sticky=tk.W, pady=3)
         self.seek_time = tk.DoubleVar(value=0)
         self.seek_slider = ttk.Scale(slider_frame, from_=0, to=100, variable=self.seek_time,
                                      orient=tk.HORIZONTAL, command=self.on_seek_change)
         self.seek_slider.grid(row=0, column=1, sticky=tk.EW, padx=5)
-        self.seek_label = ttk.Label(slider_frame, text="0.0s", width=8)
-        self.seek_label.grid(row=0, column=2, padx=5)
+        self.seek_label = ttk.Label(slider_frame, text="00:00.000  (0.0s)", width=20)
+        self.seek_label.grid(row=0, column=2, columnspan=2, padx=5)
 
-        # 開始時刻
-        ttk.Label(slider_frame, text="開始時刻 (秒):").grid(row=1, column=0, sticky=tk.W, pady=5)
+        # Row 1: ステップボタン
+        step_frame = ttk.Frame(slider_frame)
+        step_frame.grid(row=1, column=0, columnspan=4, pady=3)
+        ttk.Button(step_frame, text="◀1s",  width=5, command=lambda: self.seek_by_time(-1)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(step_frame, text="◀10f", width=5, command=lambda: self.seek_by_frames(-10)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(step_frame, text="◀1f",  width=5, command=lambda: self.seek_by_frames(-1)).pack(side=tk.LEFT, padx=2)
+        ttk.Label(step_frame, text="    ").pack(side=tk.LEFT)
+        ttk.Button(step_frame, text="▶1f",  width=5, command=lambda: self.seek_by_frames(1)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(step_frame, text="▶10f", width=5, command=lambda: self.seek_by_frames(10)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(step_frame, text="▶1s",  width=5, command=lambda: self.seek_by_time(1)).pack(side=tk.LEFT, padx=2)
+
+        # Row 2: 開始/終了設定ボタン + 再生
+        set_frame = ttk.Frame(slider_frame)
+        set_frame.grid(row=2, column=0, columnspan=4, pady=3)
+        ttk.Button(set_frame, text="ここを開始に設定", command=self.set_start_here).pack(side=tk.LEFT, padx=5)
+        ttk.Button(set_frame, text="ここを終了に設定", command=self.set_end_here).pack(side=tk.LEFT, padx=5)
+        self.play_btn = ttk.Button(set_frame, text="▶ 再生  [Space]", command=self.toggle_play)
+        self.play_btn.pack(side=tk.LEFT, padx=15)
+
+        # Row 3: 開始時刻
+        ttk.Label(slider_frame, text="開始時刻:").grid(row=3, column=0, sticky=tk.W, pady=3)
         self.start_time = tk.DoubleVar(value=0)
         self.start_slider = ttk.Scale(slider_frame, from_=0, to=100, variable=self.start_time,
                                       orient=tk.HORIZONTAL, command=self.on_start_change)
-        self.start_slider.grid(row=1, column=1, sticky=tk.EW, padx=5)
+        self.start_slider.grid(row=3, column=1, sticky=tk.EW, padx=5)
         self.start_spin = ttk.Spinbox(slider_frame, from_=0, to=3600, increment=0.5,
                                       textvariable=self.start_time, width=8,
                                       command=self.on_start_spin)
-        self.start_spin.grid(row=1, column=2, padx=5)
+        self.start_spin.grid(row=3, column=2, padx=5)
+        self.start_mmss = ttk.Label(slider_frame, text="00:00.000", foreground="gray", width=10)
+        self.start_mmss.grid(row=3, column=3, padx=5)
 
-        # 終了時刻
-        ttk.Label(slider_frame, text="終了時刻 (秒):").grid(row=2, column=0, sticky=tk.W, pady=5)
+        # Row 4: 終了時刻
+        ttk.Label(slider_frame, text="終了時刻:").grid(row=4, column=0, sticky=tk.W, pady=3)
         self.end_time = tk.DoubleVar(value=5)
         self.end_slider = ttk.Scale(slider_frame, from_=0, to=100, variable=self.end_time,
                                     orient=tk.HORIZONTAL, command=self.on_end_change)
-        self.end_slider.grid(row=2, column=1, sticky=tk.EW, padx=5)
+        self.end_slider.grid(row=4, column=1, sticky=tk.EW, padx=5)
         self.end_spin = ttk.Spinbox(slider_frame, from_=0, to=3600, increment=0.5,
                                     textvariable=self.end_time, width=8,
                                     command=self.on_end_spin)
-        self.end_spin.grid(row=2, column=2, padx=5)
+        self.end_spin.grid(row=4, column=2, padx=5)
+        self.end_mmss = ttk.Label(slider_frame, text="00:05.000", foreground="gray", width=10)
+        self.end_mmss.grid(row=4, column=3, padx=5)
 
-        # ボタン
-        btn_frame = ttk.Frame(slider_frame)
-        btn_frame.grid(row=3, column=0, columnspan=3, pady=10)
-        ttk.Button(btn_frame, text="◀ 開始位置を表示", command=lambda: self.seek_to(self.start_time.get())).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="終了位置を表示 ▶", command=lambda: self.seek_to(self.end_time.get())).pack(side=tk.LEFT, padx=5)
+        # Row 5: ズームコントロール
+        zoom_frame = ttk.Frame(slider_frame)
+        zoom_frame.grid(row=5, column=0, columnspan=4, sticky=tk.EW, pady=3)
+        ttk.Label(zoom_frame, text="シークZoom:").pack(side=tk.LEFT, padx=5)
+        self.zoom_level = tk.DoubleVar(value=1.0)
+        self._zoom_scale = ttk.Scale(zoom_frame, from_=1, to=20, variable=self.zoom_level,
+                                     orient=tk.HORIZONTAL, command=self.on_zoom_change)
+        self._zoom_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self.zoom_label_w = ttk.Label(zoom_frame, text="x1", width=4)
+        self.zoom_label_w.pack(side=tk.LEFT)
+        ttk.Button(zoom_frame, text="全体表示", command=self._reset_zoom).pack(side=tk.LEFT, padx=5)
 
-        self.time_info = ttk.Label(slider_frame, text="選択範囲: 0.0s ~ 5.0s (5.0s)", foreground="blue")
-        self.time_info.grid(row=4, column=0, columnspan=3, sticky=tk.W, pady=5)
+        # Row 6: ナビボタン
+        nav_frame = ttk.Frame(slider_frame)
+        nav_frame.grid(row=6, column=0, columnspan=4, pady=4)
+        ttk.Button(nav_frame, text="◀ 開始位置を表示",
+                   command=lambda: self.seek_to(self.start_time.get())).pack(side=tk.LEFT, padx=5)
+        ttk.Button(nav_frame, text="終了位置を表示 ▶",
+                   command=lambda: self.seek_to(self.end_time.get())).pack(side=tk.LEFT, padx=5)
+
+        # Row 7: 時間情報
+        self.time_info = ttk.Label(slider_frame,
+                                   text="選択範囲: 00:00.000 ~ 00:05.000  (5.0s)",
+                                   foreground="blue")
+        self.time_info.grid(row=7, column=0, columnspan=4, sticky=tk.W, pady=4)
 
         slider_frame.columnconfigure(1, weight=1)
 
@@ -197,7 +250,6 @@ class YouTubeToGifConverter:
         frame = ttk.Frame(tab, padding=10)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        # プレビューキャンバス（ドラッグで領域選択）
         preview_frame = ttk.LabelFrame(frame, text="プレビュー (ドラッグで領域選択)", padding=5)
         preview_frame.pack(fill=tk.BOTH, expand=True, pady=5)
 
@@ -207,11 +259,9 @@ class YouTubeToGifConverter:
         self.region_canvas.bind("<B1-Motion>", self.on_drag_motion)
         self.region_canvas.bind("<ButtonRelease-1>", self.on_drag_end)
 
-        # コントロール部分
         ctrl_frame = ttk.LabelFrame(frame, text="切り取り領域", padding=10)
         ctrl_frame.pack(fill=tk.X, pady=5)
 
-        # プリセット
         preset_frame = ttk.Frame(ctrl_frame)
         preset_frame.grid(row=0, column=0, columnspan=4, sticky=tk.W, pady=5)
         ttk.Label(preset_frame, text="プリセット:").pack(side=tk.LEFT, padx=5)
@@ -219,7 +269,6 @@ class YouTubeToGifConverter:
         ttk.Button(preset_frame, text="中央1/2", command=self.set_region_center).pack(side=tk.LEFT, padx=3)
         ttk.Button(preset_frame, text="上半分", command=self.set_region_top).pack(side=tk.LEFT, padx=3)
 
-        # 数値入力
         ttk.Label(ctrl_frame, text="x:").grid(row=1, column=0, padx=5, pady=5)
         self.region_x = tk.IntVar(value=0)
         ttk.Spinbox(ctrl_frame, from_=0, to=4000, textvariable=self.region_x, width=8,
@@ -270,8 +319,17 @@ class YouTubeToGifConverter:
         ttk.Label(grid_frame, text="(ファイル size 削減用)", foreground="gray").grid(row=2, column=2, sticky=tk.W)
 
         ttk.Label(grid_frame, text="出力先:").grid(row=3, column=0, sticky=tk.W, pady=10)
+        
+        
+        # script_dir = Path(__file__).parent.resolve()
+        # self.output_path = tk.StringVar(value=str(script_dir / "output.gif"))
         script_dir = Path(__file__).parent.resolve()
-        self.output_path = tk.StringVar(value=str(script_dir / "output.gif"))
+        output_dir = script_dir / "gif_output"
+        output_dir.mkdir(parents=True, exist_ok=True)  # フォルダがなければ作成
+        self.output_path = tk.StringVar(value=str(output_dir / "output.gif"))
+        
+        
+        
         ttk.Entry(grid_frame, textvariable=self.output_path, width=40).grid(row=3, column=1, columnspan=2, sticky=tk.EW, padx=5)
         ttk.Button(grid_frame, text="参照", command=self.select_output).grid(row=3, column=3, padx=5)
         grid_frame.columnconfigure(1, weight=1)
@@ -346,7 +404,6 @@ class YouTubeToGifConverter:
                 self._update_video_info()
                 self.status_label.config(text=f"ダウンロード完了: {Path(self.video_path).name}", foreground="green")
                 self.log("ダウンロード完了")
-                # プレビュー初期表示
                 self.root.after(100, lambda: self.seek_to(0))
 
             except Exception as e:
@@ -373,7 +430,7 @@ class YouTubeToGifConverter:
             cmd = [
                 "ffprobe", "-v", "error",
                 "-show_entries", "format=duration",
-                "-show_entries", "stream=width,height",
+                "-show_entries", "stream=width,height,r_frame_rate",
                 "-of", "default=noprint_wrappers=1",
                 self.video_path
             ]
@@ -402,6 +459,16 @@ class YouTubeToGifConverter:
                         width = int(line.split('=')[1])
                     elif line.startswith('height='):
                         height = int(line.split('=')[1])
+                    elif line.startswith('r_frame_rate='):
+                        rate = line.split('=')[1].strip()
+                        if '/' in rate:
+                            num, den = rate.split('/')
+                            den_f = float(den)
+                            if den_f > 0:
+                                self.video_fps = float(num) / den_f
+                        elif rate and rate != 'N/A':
+                            self.video_fps = float(rate)
+                        self.log(f"✓ FPS設定: {self.video_fps:.3f}")
                 except (ValueError, IndexError) as e:
                     self.log(f"    → パースエラー: {e}")
 
@@ -411,7 +478,6 @@ class YouTubeToGifConverter:
                 seconds = int(duration) % 60
                 self.duration_label.config(text=f"{minutes}分 {seconds}秒")
                 self.log(f"✓ duration設定: {duration}秒")
-                # スライダーの範囲を更新
                 self._update_slider_ranges()
 
             if width is not None and height is not None:
@@ -419,7 +485,6 @@ class YouTubeToGifConverter:
                 self.video_height = height
                 self.resolution_label.config(text=f"{width}x{height}")
                 self.log(f"✓ 解像度設定: {width}x{height}")
-                # 領域のデフォルトを全体に
                 self.region_x.set(0)
                 self.region_y.set(0)
                 self.region_w.set(width)
@@ -432,35 +497,52 @@ class YouTubeToGifConverter:
             self.file_label.config(text=Path(self.video_path).name if self.video_path else "-")
 
     def _update_slider_ranges(self):
-        """動画の長さに応じてスライダーの範囲を更新"""
         d = self.video_duration
         if d <= 0:
             return
         self.seek_slider.config(to=d)
         self.start_slider.config(to=d)
         self.end_slider.config(to=d)
-        # 終了時刻が動画長を超えていたら調整
         if self.end_time.get() > d or self.end_time.get() <= 0:
             self.end_time.set(min(5.0, d))
+        # ズームをリセット
+        self._current_zoom = 1.0
+        self.zoom_start = 0.0
+        self.zoom_end = d
+        self.zoom_level.set(1.0)
+        if hasattr(self, 'zoom_label_w'):
+            self.zoom_label_w.config(text="x1")
         self.update_time_info()
+        self.update_timeline_bar()
         self.log(f"スライダー範囲を更新: 0 ~ {d}秒")
 
     # ================= フレーム抽出・プレビュー =================
-    def extract_frame(self, timestamp):
-        """指定時刻のフレームをPNGとして抽出し、パスを返す"""
+    def extract_frame(self, timestamp, low_quality=False):
         if not self.video_path:
             return None
         try:
             tmp_dir = Path(tempfile.gettempdir())
-            frame_path = tmp_dir / "ytgif_preview_frame.png"
-            cmd = [
-                "ffmpeg", "-y",
-                "-ss", str(timestamp),
-                "-i", self.video_path,
-                "-frames:v", "1",
-                "-q:v", "2",
-                str(frame_path)
-            ]
+            if low_quality:
+                frame_path = tmp_dir / "ytgif_preview_lq.png"
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-ss", str(timestamp),
+                    "-i", self.video_path,
+                    "-frames:v", "1",
+                    "-q:v", "10",
+                    "-vf", "scale=320:-1",
+                    str(frame_path)
+                ]
+            else:
+                frame_path = tmp_dir / "ytgif_preview_frame.png"
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-ss", str(timestamp),
+                    "-i", self.video_path,
+                    "-frames:v", "1",
+                    "-q:v", "2",
+                    str(frame_path)
+                ]
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
                 self.log(f"⚠️  フレーム抽出失敗: {result.stderr[-200:]}")
@@ -472,8 +554,7 @@ class YouTubeToGifConverter:
             self.log(f"❌ フレーム抽出エラー: {e}")
             return None
 
-    def seek_to(self, timestamp):
-        """指定時刻のフレームを両方のキャンバスに表示"""
+    def seek_to(self, timestamp, low_quality=False):
         if not PIL_AVAILABLE:
             self.log("⚠️  Pillow未インストールのためプレビュー不可")
             return
@@ -482,29 +563,32 @@ class YouTubeToGifConverter:
 
         timestamp = max(0, min(timestamp, max(0, self.video_duration - 0.1)))
         self.seek_time.set(timestamp)
-        self.seek_label.config(text=f"{timestamp:.1f}s")
-        self.log(f"シーク: {timestamp:.1f}s のフレームを取得")
+        self.seek_label.config(text=f"{self.format_time(timestamp)}  ({timestamp:.1f}s)")
+        if not low_quality:
+            self.log(f"シーク: {timestamp:.1f}s のフレームを取得")
+
+        self._seek_seq += 1
+        current_seq = self._seek_seq
+        self.update_timeline_bar()
 
         def do_seek():
-            frame_path = self.extract_frame(timestamp)
-            if frame_path:
+            frame_path = self.extract_frame(timestamp, low_quality=low_quality)
+            if frame_path and self._seek_seq == current_seq:
                 self.root.after(0, lambda: self._display_frame(frame_path))
 
         threading.Thread(target=do_seek, daemon=True).start()
 
     def _display_frame(self, frame_path):
-        """抽出したフレームをキャンバスに描画"""
         try:
             img = Image.open(frame_path)
             orig_w, orig_h = img.size
 
-            # キャンバスサイズに合わせてリサイズ
             canvas_w = self.time_canvas.winfo_width()
             canvas_h = self.time_canvas.winfo_height()
             if canvas_w < 10:
                 canvas_w = 480
             if canvas_h < 10:
-                canvas_h = 270
+                canvas_h = 240
 
             scale = min(canvas_w / orig_w, canvas_h / orig_h)
             new_w = int(orig_w * scale)
@@ -515,12 +599,10 @@ class YouTubeToGifConverter:
 
             img_resized = img.resize((new_w, new_h), Image.LANCZOS)
 
-            # 時間タブ
             self.preview_image = ImageTk.PhotoImage(img_resized)
             self.time_canvas.delete("all")
             self.time_canvas.create_image(new_w // 2, new_h // 2, image=self.preview_image)
 
-            # 領域タブ
             self.region_preview_image = ImageTk.PhotoImage(img_resized)
             self.region_canvas.delete("all")
             self.region_canvas.create_image(new_w // 2, new_h // 2, image=self.region_preview_image)
@@ -531,33 +613,284 @@ class YouTubeToGifConverter:
             self.log(f"❌ プレビュー表示エラー: {e}")
 
     # ================= 時間スライダー =================
+    def format_time(self, t: float) -> str:
+        t = max(0.0, t)
+        m = int(t) // 60
+        s = int(t) % 60
+        ms = int(round((t % 1) * 1000))
+        if ms >= 1000:
+            ms = 0
+            s += 1
+        return f"{m:02d}:{s:02d}.{ms:03d}"
+
     def on_seek_change(self, value):
         t = float(value)
-        self.seek_label.config(text=f"{t:.1f}s")
+        self.seek_label.config(text=f"{self.format_time(t)}  ({t:.1f}s)")
+        # デバウンス: 80ms後に低画質シーク
+        if self._drag_debounce:
+            self.root.after_cancel(self._drag_debounce)
+        self._drag_debounce = self.root.after(80, lambda: self.seek_to(t, low_quality=True))
+        self.update_timeline_bar()
 
     def on_seek_release(self, event=None):
-        self.seek_to(self.seek_time.get())
+        # デバウンスをキャンセルして高画質で再取得
+        if self._drag_debounce:
+            self.root.after_cancel(self._drag_debounce)
+            self._drag_debounce = None
+        self.seek_to(self.seek_time.get(), low_quality=False)
 
     def on_start_change(self, value):
+        self.start_mmss.config(text=self.format_time(float(value)))
         self.update_time_info()
+        self.update_timeline_bar()
 
     def on_end_change(self, value):
+        self.end_mmss.config(text=self.format_time(float(value)))
         self.update_time_info()
+        self.update_timeline_bar()
 
     def on_start_spin(self):
+        v = self.start_time.get()
+        self.start_mmss.config(text=self.format_time(v))
         self.update_time_info()
+        self.update_timeline_bar()
 
     def on_end_spin(self):
+        v = self.end_time.get()
+        self.end_mmss.config(text=self.format_time(v))
         self.update_time_info()
+        self.update_timeline_bar()
 
     def update_time_info(self):
         try:
             start = self.start_time.get()
             end = self.end_time.get()
             dur = end - start
-            self.time_info.config(text=f"選択範囲: {start:.1f}s ~ {end:.1f}s ({dur:.1f}s)")
+            self.time_info.config(
+                text=f"選択範囲: {self.format_time(start)} ~ {self.format_time(end)}  ({dur:.1f}s)"
+            )
         except Exception:
             pass
+
+    # ================= タイムラインバー =================
+    def update_timeline_bar(self):
+        if not hasattr(self, 'timeline_canvas'):
+            return
+        c = self.timeline_canvas
+        w = c.winfo_width()
+        h = c.winfo_height()
+        if w < 10:
+            w = 480
+        if h < 10:
+            h = 40
+
+        dur = self.video_duration
+        c.delete("all")
+
+        # 背景
+        c.create_rectangle(0, 0, w, h, fill="#1a1a1a", outline="")
+
+        if dur <= 0:
+            c.create_text(w // 2, h // 2, text="動画を読み込んでください", fill="gray50", font=("", 9))
+            return
+
+        # メインバー（灰色のトラック）
+        bar_y0 = h // 2 - 5
+        bar_y1 = h // 2 + 5
+        c.create_rectangle(2, bar_y0, w - 2, bar_y1, fill="#404040", outline="")
+
+        def t_to_x(t):
+            return int(t / dur * (w - 4)) + 2
+
+        # 選択範囲（緑）
+        start = self.start_time.get()
+        end = self.end_time.get()
+        x0 = max(2, t_to_x(start))
+        x1 = min(w - 2, t_to_x(end))
+        if x1 > x0:
+            c.create_rectangle(x0, bar_y0, x1, bar_y1, fill="#4CAF50", outline="")
+
+        # ズームウィンドウ表示（黄色の枠）
+        if self._current_zoom > 1.0:
+            zx0 = max(2, t_to_x(self.zoom_start))
+            zx1 = min(w - 2, t_to_x(self.zoom_end))
+            if zx1 > zx0:
+                c.create_rectangle(zx0, 2, zx1, h - 2, outline="#FFD700", width=1)
+
+        # 開始/終了マーカー（点線）
+        xs = t_to_x(start)
+        xe = t_to_x(end)
+        if 2 <= xs <= w - 2:
+            c.create_line(xs, bar_y0 - 4, xs, bar_y1 + 4, fill="#00CC44", width=2)
+        if 2 <= xe <= w - 2:
+            c.create_line(xe, bar_y0 - 4, xe, bar_y1 + 4, fill="#FF4444", width=2)
+
+        # シーク位置（白い縦線）
+        seek = self.seek_time.get()
+        xseek = t_to_x(seek)
+        if 2 <= xseek <= w - 2:
+            c.create_line(xseek, 0, xseek, h, fill="white", width=2)
+
+        # 時刻ラベル（両端）
+        c.create_text(4, h - 3, text="0:00", fill="gray60", font=("", 7), anchor="sw")
+        c.create_text(w - 4, h - 3, text=self.format_time(dur), fill="gray60", font=("", 7), anchor="se")
+
+    def on_timeline_press(self, event):
+        self._seek_from_timeline(event.x, low_quality=True)
+
+    def on_timeline_drag(self, event):
+        self._seek_from_timeline(event.x, low_quality=True)
+
+    def on_timeline_release(self, event):
+        self._seek_from_timeline(event.x, low_quality=False)
+
+    def _seek_from_timeline(self, x, low_quality):
+        dur = self.video_duration
+        if dur <= 0:
+            return
+        w = self.timeline_canvas.winfo_width()
+        if w < 10:
+            w = 480
+        t = (x - 2) / (w - 4) * dur
+        self.seek_to(t, low_quality=low_quality)
+
+    # ================= 開始/終了設定・ステップ移動 =================
+    def set_start_here(self):
+        t = self.seek_time.get()
+        self.start_time.set(t)
+        self.start_mmss.config(text=self.format_time(t))
+        self.update_time_info()
+        self.update_timeline_bar()
+        self.log(f"開始時刻を設定: {self.format_time(t)}")
+
+    def set_end_here(self):
+        t = self.seek_time.get()
+        self.end_time.set(t)
+        self.end_mmss.config(text=self.format_time(t))
+        self.update_time_info()
+        self.update_timeline_bar()
+        self.log(f"終了時刻を設定: {self.format_time(t)}")
+
+    def seek_by_frames(self, n: int):
+        fps = max(1.0, self.video_fps)
+        delta = n / fps
+        t = self.seek_time.get() + delta
+        self.seek_to(t)
+
+    def seek_by_time(self, delta: float):
+        t = self.seek_time.get() + delta
+        self.seek_to(t)
+
+    # ================= 再生/停止 =================
+    def toggle_play(self):
+        if self.is_playing:
+            self.is_playing = False
+            if self._play_job:
+                self.root.after_cancel(self._play_job)
+                self._play_job = None
+            self.play_btn.config(text="▶ 再生  [Space]")
+            self.log("再生停止")
+        else:
+            if not self.video_path:
+                return
+            self.is_playing = True
+            self.play_btn.config(text="■ 停止  [Space]")
+            self.log("再生開始")
+            self._play_next_frame()
+
+    def _play_next_frame(self):
+        if not self.is_playing:
+            return
+        fps = max(1.0, self.video_fps)
+        step = 1.0 / fps
+        t = self.seek_time.get() + step
+        if t >= self.video_duration:
+            self.is_playing = False
+            self.play_btn.config(text="▶ 再生  [Space]")
+            self.log("再生終了（末尾に到達）")
+            return
+
+        self._seek_seq += 1
+        current_seq = self._seek_seq
+        self.seek_time.set(t)
+        self.seek_label.config(text=f"{self.format_time(t)}  ({t:.1f}s)")
+        self.update_timeline_bar()
+
+        def do_frame():
+            frame_path = self.extract_frame(t, low_quality=True)
+            if frame_path and self._seek_seq == current_seq:
+                self.root.after(0, lambda: (
+                    self._display_frame(frame_path),
+                    self._play_next_frame() if self.is_playing else None
+                ))
+
+        threading.Thread(target=do_frame, daemon=True).start()
+
+    # ================= ズーム =================
+    def on_zoom_change(self, value):
+        zoom = max(1.0, float(value))
+        self._current_zoom = zoom
+        label = f"x{int(zoom)}" if zoom == int(zoom) else f"x{zoom:.1f}"
+        self.zoom_label_w.config(text=label)
+
+        dur = self.video_duration
+        if dur <= 0:
+            return
+        center = self.seek_time.get()
+        window = dur / zoom
+        half_w = window / 2
+        z_start = max(0.0, center - half_w)
+        z_end = min(dur, z_start + window)
+        # 端に当たった場合の調整
+        if z_end >= dur:
+            z_end = dur
+            z_start = max(0.0, dur - window)
+        self.zoom_start = z_start
+        self.zoom_end = z_end
+
+        self.seek_slider.config(from_=z_start, to=z_end)
+        self.update_timeline_bar()
+
+    def _reset_zoom(self):
+        self._current_zoom = 1.0
+        self.zoom_level.set(1.0)
+        self.zoom_label_w.config(text="x1")
+        dur = self.video_duration
+        self.zoom_start = 0.0
+        self.zoom_end = dur if dur > 0 else 1.0
+        self.seek_slider.config(from_=0, to=max(1, dur))
+        self.update_timeline_bar()
+        self.log("ズームをリセット")
+
+    # ================= キーボードショートカット =================
+    def _setup_keybindings(self):
+        self.root.bind("<Left>", self._on_key)
+        self.root.bind("<Right>", self._on_key)
+        self.root.bind("<Shift-Left>", self._on_key)
+        self.root.bind("<Shift-Right>", self._on_key)
+        self.root.bind("<space>", self._on_space_key)
+
+    def _on_key(self, event):
+        focused = self.root.focus_get()
+        if isinstance(focused, (ttk.Entry, ttk.Spinbox, tk.Entry, tk.Text)):
+            return
+        shift = bool(event.state & 0x1)
+        if event.keysym == "Left":
+            if shift:
+                self.seek_by_time(-1)
+            else:
+                self.seek_by_frames(-1)
+        elif event.keysym == "Right":
+            if shift:
+                self.seek_by_time(1)
+            else:
+                self.seek_by_frames(1)
+
+    def _on_space_key(self, event):
+        focused = self.root.focus_get()
+        if isinstance(focused, (ttk.Entry, ttk.Spinbox, tk.Entry, tk.Text)):
+            return
+        self.toggle_play()
 
     # ================= 領域選択（マウスドラッグ） =================
     def on_drag_start(self, event):
@@ -587,17 +920,14 @@ class YouTubeToGifConverter:
         x0, y0 = self.drag_start
         x1, y1 = event.x, event.y
 
-        # 座標を正規化（左上→右下）
         cx0, cx1 = min(x0, x1), max(x0, x1)
         cy0, cy1 = min(y0, y1), max(y0, y1)
 
-        # 画像表示範囲内にクリップ
         cx0 = max(0, min(cx0, self.canvas_img_w))
         cx1 = max(0, min(cx1, self.canvas_img_w))
         cy0 = max(0, min(cy0, self.canvas_img_h))
         cy1 = max(0, min(cy1, self.canvas_img_h))
 
-        # キャンバス座標 → 元動画座標に変換
         orig_x = int(cx0 / self.preview_scale)
         orig_y = int(cy0 / self.preview_scale)
         orig_w = int((cx1 - cx0) / self.preview_scale)
@@ -607,7 +937,6 @@ class YouTubeToGifConverter:
             self.log("⚠️  選択領域が小さすぎます")
             return
 
-        # 偶数に丸める（ffmpegの要件対策）
         orig_w = orig_w - (orig_w % 2)
         orig_h = orig_h - (orig_h % 2)
 
@@ -620,7 +949,6 @@ class YouTubeToGifConverter:
         self._draw_region_rect()
 
     def _draw_region_rect(self):
-        """現在の領域設定を赤枠でキャンバスに描画"""
         if self.preview_scale <= 0:
             return
         if self.drag_rect:
@@ -781,6 +1109,5 @@ class YouTubeToGifConverter:
 if __name__ == "__main__":
     root = tk.Tk()
     app = YouTubeToGifConverter(root)
-    # シークスライダーは離したときにフレーム更新
     app.seek_slider.bind("<ButtonRelease-1>", app.on_seek_release)
     root.mainloop()
