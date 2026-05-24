@@ -377,7 +377,9 @@ class YouTubeToGifConverter:
 
                 cmd = [
                     downloader, "-f", "best",
-                    "-o", str(output_dir / "%(title)s.%(ext)s"),
+                    # "-o", str(output_dir / "%(title)s.%(ext)s"),
+                    "-o", str(output_dir / "%(title).50s.%(ext)s"),
+                    "--restrict-filenames",
                     "--print", "after_move:filepath", url
                 ]
                 self.log(f"コマンド実行: {' '.join(cmd)}")
